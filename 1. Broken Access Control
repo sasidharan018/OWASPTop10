@@ -1,0 +1,317 @@
+# Lab 2: Broken Access Control
+
+## Objective
+Identify broken access control vulnerabilities through database queries and understand proper authorization mechanisms.
+
+## Lab Setup Requirements
+- MySQL database access (terminal or phpMyAdmin)
+
+---
+
+## Exercise 1: Setup and Identify IDOR Vulnerabilities
+
+### Step 1: Create Database
+```sql
+CREATE DATABASE broken_access_lab;
+USE broken_access_lab;
+
+CREATE TABLE users (
+ id INT AUTO_INCREMENT PRIMARY KEY,
+ username VARCHAR(50),
+ email VARCHAR(100),
+ role ENUM('admin', 'user', 'guest') DEFAULT 'user',
+ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE user_profiles (
+ id INT AUTO_INCREMENT PRIMARY KEY,
+ user_id INT,
+ phone VARCHAR(20),
+ address TEXT,
+ ssn VARCHAR(11),
+ FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE TABLE documents (
+ id INT AUTO_INCREMENT PRIMARY KEY,
+ title VARCHAR(100),
+ content TEXT,
+ owner_id INT,
+ is_private BOOLEAN DEFAULT TRUE,
+ FOREIGN KEY (owner_id) REFERENCES users(id)
+);
+
+INSERT INTO users (username, email, role) VALUES
+('alice', 'alice@example.com', 'user'),
+('bob', 'bob@example.com', 'user'),
+('admin', 'admin@example.com', 'admin');
+
+INSERT INTO user_profiles (user_id, phone, address, ssn) VALUES
+(1, '555-0101', '123 Main St', '123-45-6789'),
+(2, '555-0102', '456 Oak Ave', '987-65-4321'),
+(3, '555-0100', '789 Admin Rd', '111-22-3333');
+
+INSERT INTO documents (title, content, owner_id, is_private) VALUES
+('Alice Notes', 'My secret project plans', 1, TRUE),
+('Bob Financial', 'Bank account: $50,000', 2, TRUE),
+('Public Announcement', 'Welcome message', 3, FALSE),
+('Admin Policy', 'Confidential company data', 3, TRUE);
+```
+
+### Step 2: Exploit IDOR (Insecure Direct Object Reference)
+
+**Vulnerable Query - No Ownership Check:**
+```sql
+-- Simulating: Alice (user_id=1) accessing ANY profile by changing ID
+-- URL: /profile.php?user_id=2
+
+SELECT u.username, p.phone, p.address, p.ssn
+FROM users u
+JOIN user_profiles p ON u.id = p.user_id
+WHERE u.id = 2;
+```
+
+**Result:** ✅ Returns Bob's sensitive data including SSN! 🚨 **IDOR VULNERABILITY**
+
+**Attack: Enumerate All User Data**
+```sql
+-- Attacker cycles through IDs to steal all data
+SELECT 
+  u.id,
+  u.username,
+  u.email,
+  p.ssn,
+  p.phone,
+  '🚨 EXPOSED' as status
+FROM users u
+JOIN user_profiles p ON u.id = p.user_id;
+```
+
+### Step 3: Test Secure Implementation
+
+**Secure Query - With Ownership Validation:**
+```sql
+-- Alice (user_id=1) tries to access Bob's profile (user_id=2)
+-- Must validate: @current_user_id = requested user_id
+
+SET @current_user_id = 1;  -- Alice's session
+
+SELECT u.username, p.phone, p.address, p.ssn
+FROM users u
+JOIN user_profiles p ON u.id = p.user_id
+WHERE u.id = 2 AND u.id = @current_user_id;
+```
+
+**Result:** ❌ Empty set - **ACCESS DENIED!** ✅
+
+**Alice Can Only Access Her Own Profile:**
+```sql
+SET @current_user_id = 1;
+
+SELECT u.username, p.phone, p.address, p.ssn
+FROM users u
+JOIN user_profiles p ON u.id = p.user_id
+WHERE u.id = 1 AND u.id = @current_user_id;
+```
+
+**Result:** ✅ Returns only Alice's data - **AUTHORIZED!**
+
+---
+
+## Exercise 2: Horizontal Privilege Escalation
+
+### Step 1: Document Access Without Authorization
+
+**Vulnerable Query:**
+```sql
+-- Alice accessing ANY document by ID
+-- URL: /document.php?doc_id=2
+SELECT * FROM documents WHERE id = 2;
+```
+
+**Result:** ✅ Returns Bob's private financial document! 🚨
+
+**Attack Scenario:**
+```sql
+-- View all private documents without permission
+SELECT 
+  id,
+  title,
+  owner_id,
+  SUBSTRING(content, 1, 30) as preview,
+  '🚨 UNAUTHORIZED ACCESS' as status
+FROM documents
+WHERE is_private = TRUE;
+```
+
+### Step 2: Secure Implementation with Ownership Check
+
+**Secure Query:**
+```sql
+-- Alice (user_id=1) tries to access document 2 (owned by Bob, user_id=2)
+SET @current_user_id = 1;
+
+SELECT d.*, u.username as owner
+FROM documents d
+JOIN users u ON d.owner_id = u.id
+WHERE d.id = 2 
+  AND (d.owner_id = @current_user_id OR d.is_private = FALSE);
+```
+
+**Result:** ❌ Empty set - **ACCESS DENIED!** ✅
+
+**Alice Accessing Her Own Document:**
+```sql
+SET @current_user_id = 1;
+
+SELECT d.*, u.username as owner
+FROM documents d
+JOIN users u ON d.owner_id = u.id
+WHERE d.id = 1 
+  AND (d.owner_id = @current_user_id OR d.is_private = FALSE);
+```
+
+**Result:** ✅ Returns Alice's document - **AUTHORIZED!**
+
+---
+
+## Exercise 3: Vertical Privilege Escalation
+
+### Step 1: Missing Role Verification
+
+**Vulnerable Query - Anyone Can Delete Users:**
+```sql
+-- Regular user Bob (user_id=2) tries to delete Alice
+-- URL: /admin/delete_user.php?user_id=1
+
+DELETE FROM user_profiles WHERE user_id = 1;
+DELETE FROM users WHERE id = 1;
+
+-- Check if deleted
+SELECT * FROM users WHERE id = 1;
+```
+
+**Result:** Alice deleted! 🚨 **NO ROLE CHECK**
+
+**Rollback:**
+```sql
+ROLLBACK;
+```
+
+### Step 2: Secure Implementation with Role Check
+
+**Secure Query - Verify Admin Role:**
+```sql
+-- Step 1: Check if current user has admin role
+SET @current_user_id = 2;  -- Bob (regular user)
+
+SELECT 
+  'Role Verification' as check_type,
+  username,
+  role,
+  CASE 
+    WHEN role = 'admin' THEN '✅ AUTHORIZED'
+    ELSE '🚨 FORBIDDEN - Admin role required'
+  END as authorization_status
+FROM users 
+WHERE id = @current_user_id;
+```
+
+**Result:** Bob is NOT admin - **FORBIDDEN!** ✅
+
+**Admin Performing Authorized Action:**
+```sql
+SET @current_user_id = 3;  -- Admin user
+
+SELECT 
+  'Role Verification' as check_type,
+  username,
+  role,
+  CASE 
+    WHEN role = 'admin' THEN '✅ AUTHORIZED - Can proceed'
+    ELSE '🚨 FORBIDDEN'
+  END as authorization_status
+FROM users 
+WHERE id = @current_user_id;
+```
+
+**Result:** Admin is authorized - **CAN PROCEED!** ✅
+
+### Step 3: Access Control Matrix
+
+**Test All Scenarios:**
+```sql
+-- Comprehensive access control test
+SELECT 
+  u.username,
+  u.role,
+  d.id as doc_id,
+  d.title,
+  CASE
+    WHEN u.role = 'admin' THEN '✅ ADMIN: Full Access'
+    WHEN d.owner_id = u.id THEN '✅ OWNER: Can Access'
+    WHEN d.is_private = FALSE THEN '✅ PUBLIC: Can View'
+    ELSE '🚨 DENIED: No Permission'
+  END as access_decision
+FROM users u
+CROSS JOIN documents d
+ORDER BY u.username, d.id;
+```
+
+**Results Show:**
+- Admin can access everything
+- Users can only access their own private documents
+- Everyone can access public documents
+
+---
+
+## Key Takeaways
+
+### Vulnerability Summary
+
+| Vulnerability | Example | Impact |
+|---------------|---------|--------|
+| **IDOR** | `/profile?id=2` without ownership check | Access any user's data |
+| **Horizontal Escalation** | User accessing peer's resources | Privacy breach |
+| **Vertical Escalation** | User performing admin actions | System compromise |
+
+### ❌ Vulnerable Patterns
+```sql
+-- No ownership validation
+SELECT * FROM documents WHERE id = @doc_id;
+
+-- No role verification
+DELETE FROM users WHERE id = @user_id;
+
+-- Direct ID exposure
+SELECT * FROM user_profiles WHERE user_id = @requested_id;
+```
+
+### ✅ Secure Patterns
+```sql
+-- Ownership validation
+WHERE resource.owner_id = @current_user_id
+
+-- Role verification
+WHERE (SELECT role FROM users WHERE id = @current_user_id) = 'admin'
+
+-- Combined authorization
+WHERE resource.owner_id = @current_user_id 
+   OR @current_user_role = 'admin'
+```
+
+### Security Checklist
+- ✅ Always validate user identity
+- ✅ Check resource ownership
+- ✅ Verify user role/permissions
+- ✅ Implement deny-by-default policy
+- ✅ Use session variables for user context
+- ✅ Never trust client-supplied IDs
+
+---
+
+## Cleanup
+
+```sql
+DROP DATABASE broken_access_lab;
+```
